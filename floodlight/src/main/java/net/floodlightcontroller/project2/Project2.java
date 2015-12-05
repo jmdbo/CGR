@@ -61,8 +61,9 @@ public class Project2  implements IFloodlightModule, IOFMessageListener {
     // CGR: data structures for the learning switch feature
     // Stores the learned state for each switch
     protected Map<IOFSwitch, Map<MacAddress, OFPort>> macToSwitchPortMap;
+    protected Map<MacAddress, Map<MacAddress, Long>> firewall;
 	protected HashMap<Long, Long> blacklist;
-   
+
  // flow-mod - for use in the cookie
      public static final int PROJECT2_APP_ID = 1;
      // LOOK! This should probably go in some class that encapsulates
@@ -73,6 +74,11 @@ public class Project2  implements IFloodlightModule, IOFMessageListener {
     
     // for managing our map sizes
     protected static final int MAX_MACS_PER_SWITCH  = 1000;
+    protected static final int MAX_CONNECTION = 1000;
+    protected static final int MAX_DESTINATION_NUMBER = 2;
+    protected static final long TIMEOUT_FIREWALL = 60000; //Miliseconds
+    protected static final short TIMEOUT_FLOWMOD = 60; //Seconds
+    
    
     @Override
     public String getName() {
@@ -250,6 +256,7 @@ public class Project2  implements IFloodlightModule, IOFMessageListener {
         //get MAC addresses from the Packet_in data
         MacAddress sourceMac = eth.getSourceMACAddress();
         MacAddress destMac = eth.getDestinationMACAddress();
+        Date d = new Date();
        
         if (sourceMac == null) {
             sourceMac = MacAddress.NONE;
@@ -269,6 +276,40 @@ public class Project2  implements IFloodlightModule, IOFMessageListener {
         Hint: You may check connection limitation here.
         ....
 */
+        Map<MacAddress, Long> fwMap;
+        if(sw!=null && (sourceMac.getLong() & 0x010000000000L) == 0 && (destMac.getLong() & 0x010000000000L) == 0){
+	        if(firewall.containsKey(sourceMac)){
+	        	log.info("Verifying firewall!");
+	        	fwMap = firewall.get(sourceMac);
+	        	for(Long timeout : fwMap.values()){
+	        		if(timeout < d.getTime()){
+	        			fwMap.remove(destMac);
+	        		}
+	        	}
+	        	
+	        	if(!fwMap.containsKey(destMac)){
+	        		fwMap.put(destMac, d.getTime() + TIMEOUT_FIREWALL);
+	        		log.info("Added  {} -> {} to firewall ", new Object[]{sourceMac, destMac});
+	        	}
+	        	if(fwMap.size() > MAX_DESTINATION_NUMBER){
+	        		Match.Builder mb = sw.getOFFactory().buildMatch();
+	        		mb.setExact(MatchField.ETH_SRC, sourceMac);
+	        		List<OFAction> al = new ArrayList<OFAction>();
+	        		al.add(sw.getOFFactory().actions().buildOutput().setPort(pi.getInPort()).setMaxLen(0xffFFffFF).build());
+	        		log.info("Blocking  {} Host ", sourceMac);
+	        		this.writeFlowMod(sw, OFFlowModCommand.DELETE, pi.getBufferId(), mb.build(), al, pi.getInPort(), (short) 0, (short)0);
+	        		return Command.CONTINUE;
+	        	}
+	        }
+	        else{
+	        	log.info("Adding Host to Firewall!");
+	        	fwMap = Collections.synchronizedMap(new LRULinkedHashMap<MacAddress, Long>(MAX_CONNECTION)); // creates HashMap for mac/port
+	        	fwMap.put(destMac, d.getTime()+ TIMEOUT_FIREWALL);
+	        	log.info("Added  {} -> {} to firewall ", new Object[]{sourceMac, destMac});
+	        	firewall.put(sourceMac, fwMap);
+	        }
+        }
+        
 
 /* CGR: Filter-out hosts in blacklist
  *         Also, when the host is in blacklist check if the blockout time is
@@ -277,16 +318,21 @@ public class Project2  implements IFloodlightModule, IOFMessageListener {
         
         if (blacklist.containsKey(sourceMac.getLong())){
         	long blockout = blacklist.get(sourceMac.getLong());
-        	Date d = new Date();
+        	
         	if(blockout >= d.getTime())
         		return Command.CONTINUE;
+        	else{
+        		blacklist.remove(sourceMac);
+        	}
         }
         
         if (blacklist.containsKey(destMac.getLong())){
         	long blockout = blacklist.get(destMac.getLong());
-        	Date d = new Date();
         	if(blockout >= d.getTime())
         		return Command.CONTINUE;
+        	else{
+        		blacklist.remove(destMac);
+        	}
         }
           
             
@@ -339,7 +385,7 @@ public class Project2  implements IFloodlightModule, IOFMessageListener {
             List<OFAction> al = new ArrayList<OFAction>(); //create action list
             al.add(sw.getOFFactory().actions().buildOutput().setPort(outPort).setMaxLen(0xffFFffFF).build()); // buid action forward in por outPort
             //finally build the flow with this match and actions ans write it to the switch
-            this.writeFlowMod(sw, OFFlowModCommand.ADD, pi.getBufferId(), match, al, outPort, (short)0, (short)0);
+            this.writeFlowMod(sw, OFFlowModCommand.ADD, pi.getBufferId(), match, al, outPort, (short) 0, TIMEOUT_FLOWMOD);
         }
         
         return Command.CONTINUE;
@@ -439,6 +485,8 @@ public class Project2  implements IFloodlightModule, IOFMessageListener {
                     new ConcurrentHashMap<IOFSwitch, Map<MacAddress, OFPort>>();
             blacklist =
                     new HashMap<Long, Long>();
+            firewall = 
+            		new ConcurrentHashMap<MacAddress, Map<MacAddress, Long>>();
            
             log.info("Project 2 modules initialized");
        
